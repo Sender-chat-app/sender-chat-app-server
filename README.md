@@ -1,155 +1,66 @@
-# Sender backend
+# Sender Chat
 
-## Database workflow
+Sender Chat is a production-oriented real-time one-to-one messaging application.
 
-PostgreSQL is the durable source of truth. Flyway applies versioned migrations
-from `src/main/resources/db/migration` before Hibernate validates the mapped
-entities. Do not use `spring.jpa.hibernate.ddl-auto=update` or edit an applied
-migration. Schema changes must be added as a new migration, for example
-`V2__add_conversations.sql`.
+## Technology
 
-### First-time local setup
+- **Backend:** Java 21, Spring Boot, Spring Security, Spring Data JPA, PostgreSQL, Redis, WebSocket/STOMP
+- **Frontend:** Next.js App Router, TypeScript, React, TanStack Query, Tailwind CSS, shadcn-style UI
+- **Development:** Maven, npm, Docker Compose for local infrastructure
 
-```bash
-cp .env.example .env
-# Fill S3_* with your AWS bucket, region, IAM keys, and public/CDN base URL
-docker compose up -d postgres redis
-./mvnw spring-boot:run
+## Repository layout
+
+```text
+backend/   Spring Boot application
+frontend/  Next.js application
+docs/      Persistent architecture and implementation context
+perf/      Exploratory k6 load-test harness (seed data, scenarios, operator runbook)
 ```
 
-Redis holds ephemeral presence sessions and presence transition pub/sub. Without
-Redis, set `PRESENCE_STORE=memory` for single-instance local use only. For Redis
-Cloud, set `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, usually
-`REDIS_USERNAME=default`, and `REDIS_SSL=true` when the endpoint requires TLS.
+## Exploratory load testing
 
-Spring Boot imports `backend/.env` automatically (see `spring.config.import` in
-`application.properties`). You can still `set -a && source .env && set +a` to
-export the same values into the shell before other tools.
+The repository includes an optional **k6** harness under [`perf/`](perf/) for manual, exploratory runs against the **public REST + STOMP API** on a **single app instance** (in-memory STOMP broker). It is not a CI gate or production SLA certificate.
 
-Create the AWS S3 bucket in the console and configure public-read for public
-prefixes plus browser CORS for `FRONTEND_URL` before running the app. Features
-share the bucket via key prefixes (e.g. `avatars/*`, `group-avatars/*`). Set `S3_PUBLIC_BASE_URL`
-to the bucket URL or CloudFront base.
+- **Operator runbook:** [`perf/RUNBOOK.md`](perf/RUNBOOK.md) — prerequisites, scenarios (`smoke`, `realistic`, `stress`), soft-stop thresholds, and what to watch on host / Postgres / Redis.
+- **Harness summary:** [`perf/README.md`](perf/README.md) — what each ticket delivered.
+- **Perf env overlay:** copy values from [`perf/env.perf.example`](perf/env.perf.example) into `backend/.env` only on dedicated load-test machines. Normal local development keeps the safe defaults in [`backend/.env.example`](backend/.env.example); do not commit secrets or local `.env` files.
 
-User and group avatars are loaded in the browser via public object URLs. Message
-attachments stay private (presigned GET). For avatar images to display, allow
-anonymous `s3:GetObject` on those prefixes only (Bucket policy), after relaxing
-Block Public Access enough to permit that policy:
+**v1 scope:** direct-message pairs, REST send, STOMP `/user/queue/events`, presence heartbeats, optional inbox/history reads in the realistic scenario. **Phase 2 (not in v1):** group chat, search, typing, attachments under load, multi-instance STOMP fan-out, Grafana dashboards, and automated perf in CI. See [`docs/plan.md`](docs/plan.md).
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "PublicReadAvatars",
-      "Effect": "Allow",
-      "Principal": "*",
-      "Action": "s3:GetObject",
-      "Resource": [
-        "arn:aws:s3:::YOUR_BUCKET_NAME/avatars/*",
-        "arn:aws:s3:::YOUR_BUCKET_NAME/group-avatars/*"
-      ]
-    }
-  ]
-}
-```
+## Development status
 
-Do not make `message-attachments/*` public.
+The repository currently contains starter backend and frontend applications. Feature implementation follows the vertical slices in [`docs/plan.md`](docs/plan.md).
 
-### Rate limiting
+The first planned feature slices are:
 
-All rate limits share `common/ratelimit`. Endpoints opt in with
-`@RateLimited(RateLimitPolicy.X)`; exceeding the limit returns `429` with a
-`Retry-After` header. Typing events over WebSocket are dropped silently.
-The window is `RATE_LIMIT_WINDOW` (default `1m`) and the maximum hits per
-window for each policy is `RATE_LIMIT_<POLICY>_MAX_HITS` in `.env`
-(see `.env.example`). Auth endpoints are keyed by client IP; all others by the
-authenticated user. Counters are in memory and reset on restart. Behind a
-reverse proxy, configure `server.forward-headers-strategy` so the real client
-IP is used.
+1. Project foundation and configuration
+2. Authentication
+3. Users and friendships
+4. Direct conversations
+5. Persistent messaging
+6. Read/delivery state
+7. Realtime messaging, receipts, and presence
 
-Object storage is AWS S3 (optional CloudFront). The bucket must allow browser
-PUT from `FRONTEND_URL` and public or CDN reads for public prefixes such as
-`avatars/*` and `group-avatars/*`. Avatar size limit is `AVATAR_MAX_BYTES` (default 2MB).
+## Architectural decisions
 
-Browser uploads use presigned PUT with a signed `Content-Type` header. Configure
-bucket CORS for your frontend origin or OPTIONS/PUT will return **403**:
+- PostgreSQL is the source of truth for durable application data.
+- Redis is used only for ephemeral presence, short-lived cache, and realtime fan-out.
+- Direct-message creation is REST-based; WebSocket/STOMP distributes committed events.
+- Access tokens are short-lived JWTs; refresh tokens are rotated opaque tokens stored in secure HttpOnly cookies.
+- TanStack Query owns server state in the frontend. Local React state owns transient UI state.
+- Registration validates password confirmation in the browser only; it is never sent to the backend.
+- Logout supports revoking the current session or all refresh sessions. Changing a password revokes all refresh sessions.
+- The product supports direct and group conversations, text messages, and optional file attachments. Blocking, moderation, and account recovery are deferred.
 
-```json
-[
-  {
-    "AllowedOrigins": ["http://localhost:3000"],
-    "AllowedMethods": ["GET", "PUT", "HEAD"],
-    "AllowedHeaders": ["Content-Type"],
-    "ExposeHeaders": ["ETag"],
-    "MaxAgeSeconds": 3000
-  }
-]
-```
+See the complete design in [`docs/architecture.md`](docs/architecture.md) and the implementation sequence in [`docs/plan.md`](docs/plan.md).
 
-Replace the origin with `FRONTEND_URL` in non-local environments. The IAM user
-behind `S3_ACCESS_KEY` / `S3_SECRET_KEY` needs object access on the app key
-prefixes (`avatars/*`, `group-avatars/*`, `message-attachments/*`). HeadObject
-uses `s3:GetObject` (there is no separate `s3:HeadObject` action):
+When the backend is running, API documentation is available at `http://localhost:8080/swagger-ui.html`.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "SenderObjectPrefixes",
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:GetObject",
-        "s3:DeleteObject"
-      ],
-      "Resource": [
-        "arn:aws:s3:::YOUR_BUCKET_NAME/avatars/*",
-        "arn:aws:s3:::YOUR_BUCKET_NAME/group-avatars/*",
-        "arn:aws:s3:::YOUR_BUCKET_NAME/message-attachments/*"
-      ]
-    }
-  ]
-}
-```
+## Working agreements
 
-The application connects to `localhost:5432/sender` by default. Override the
-connection with `DATABASE_URL`, `DATABASE_USERNAME`, and `DATABASE_PASSWORD`.
-Flyway creates and records the schema in its `flyway_schema_history` table
-automatically during application startup.
-
-If a database already contains the schema created by the old Hibernate
-`update` mode, back it up and perform a one-time baseline only after checking
-that it matches `V1`:
-
-```bash
-SPRING_FLYWAY_BASELINE_ON_MIGRATE=true \
-SPRING_FLYWAY_BASELINE_VERSION=1 \
-./mvnw spring-boot:run
-```
-
-Do not use this for a new or partially initialized database; Flyway must run
-`V1` there.
-
-### Applying a migration
-
-1. Create a new numbered SQL file under `src/main/resources/db/migration`.
-2. Test it against a fresh database and a database containing the previous
-   migrations.
-3. Deploy the application; Flyway runs pending migrations in version order.
-4. Never modify a migration that has already been applied. Create a corrective
-   migration instead.
-
-
-To recreate the local database, stop the stack and remove only its named
-volume:
-
-```bash
-docker compose down
-docker volume rm backend_sender-postgres-data
-docker compose up -d postgres
-```
-
-The volume name may be prefixed by the Compose project name; use
-`docker volume ls` to identify it before removal.
+- Read the relevant documentation before changing a feature.
+- Implement one vertical slice at a time.
+- Keep REST operations authoritative and realtime events idempotent.
+- Validate and authorize every request on the server.
+- Add behavior-focused tests with each meaningful feature.
+- Do not add infrastructure or dependencies without documenting the reason.
