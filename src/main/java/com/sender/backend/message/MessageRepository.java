@@ -66,28 +66,6 @@ public interface MessageRepository extends JpaRepository<Message, Long> {
     List<Integer> findSenderIdsThrough(@Param("conversationId") Integer conversationId,
                                        @Param("messageId") Long messageId);
 
-    @Query("""
-        select count(m) from Message m
-        where m.conversation.id = :conversationId
-          and m.sender.id <> :userId
-        """)
-    long countUnread(@Param("conversationId") Integer conversationId,
-                     @Param("userId") Integer userId);
-
-    @Query("""
-        select count(m) from Message m
-        where m.conversation.id = :conversationId
-          and m.sender.id <> :userId
-          and (
-            m.createdAt > :readAt
-            or (m.createdAt = :readAt and m.id > :readId)
-          )
-        """)
-    long countUnreadAfter(@Param("conversationId") Integer conversationId,
-                          @Param("userId") Integer userId,
-                          @Param("readAt") Instant readAt,
-                          @Param("readId") Long readId);
-
     @Query(value = """
         select m.id as id, m.created_at as createdAt,
                ts_rank_cd(to_tsvector('simple', immutable_unaccent(m.body)),

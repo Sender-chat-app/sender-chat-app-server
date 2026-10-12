@@ -15,7 +15,7 @@ public final class MessageProgressDtos {
             Instant deliveredAt,
             Long readThroughMessageId,
             Instant readAt,
-            long unreadCount) {}
+            boolean hasUnread) {}
 
     public record ProgressEvent(
             Integer conversationId,

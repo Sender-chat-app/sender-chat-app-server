@@ -67,7 +67,7 @@ public final class ConversationDtos {
     }
 
     public record Summary(Integer id, Conversation.Type type, String name, String avatarUrl, PublicUser otherUser,
-                          LatestMessage latestMessage, int unreadCount, Instant updatedAt, boolean online) {}
+                          LatestMessage latestMessage, boolean hasUnread, Instant updatedAt, boolean online) {}
 
     public record Page<T>(List<T> items, String nextCursor, boolean hasMore) {}
 }

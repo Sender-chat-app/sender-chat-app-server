@@ -14,7 +14,7 @@ import org.springframework.web.bind.annotation.*;
 
 @RestController
 @RequestMapping("/api/v1/conversations/{conversationId}")
-@Tag(name = "Message progress", description = "Delivery, read, and unread progress")
+@Tag(name = "Message progress", description = "Delivery, read, and unread indicators")
 @SecurityRequirement(name = "bearerAuth")
 public class MessageProgressController {
     private final MessageProgressService progress;

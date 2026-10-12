@@ -4,6 +4,8 @@ import com.sender.backend.conversation.Conversation;
 import com.sender.backend.conversation.ConversationMember;
 import com.sender.backend.conversation.ConversationMemberRepository;
 import com.sender.backend.conversation.ConversationRepository;
+import com.sender.backend.message.MessageProgressDtos.ProgressRequest;
+import com.sender.backend.message.MessageProgressDtos.ProgressResponse;
 import com.sender.backend.realtime.RealtimePublisher;
 import com.sender.backend.user.User;
 import org.junit.jupiter.api.BeforeEach;
@@ -15,11 +17,12 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.lang.reflect.Field;
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.*;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -37,29 +40,51 @@ class MessageProgressServiceTest {
 	}
 
 	@Test
-	void unreadCountsBatchesMembershipsAndOverlaysPendingRead() throws Exception {
-		Conversation first = Conversation.direct("1:2");
-		setConversationId(first, 10);
-		Conversation second = Conversation.direct("1:3");
-		setConversationId(second, 11);
+	void acceptReadReportsHasUnreadFromLatestVersusReadCursor() throws Exception {
+		Conversation conversation = Conversation.direct("1:2");
+		setConversationId(conversation, 10);
 		User alice = user(1, "alice");
-		ConversationMember membership10 = new ConversationMember(first, alice);
-		ConversationMember membership11 = new ConversationMember(second, alice);
-		setReadCursor(membership10, 5L, Instant.parse("2026-10-08T00:00:00Z"));
+		User bob = user(2, "bob");
+		ConversationMember membership = new ConversationMember(conversation, alice);
+		Instant readAt = membership.getJoinedAt().plusSeconds(10);
+		setReadCursor(membership, 5L, readAt);
+		Message readThrough = new Message(conversation, bob, "older", UUID.randomUUID(), List.of());
+		setMessageId(readThrough, 5L);
+		setMessageCreatedAt(readThrough, readAt);
+		Message latest = new Message(conversation, bob, "newer", UUID.randomUUID(), List.of());
+		setMessageId(latest, 9L);
+		setMessageCreatedAt(latest, readAt.plusSeconds(60));
 
-		when(members.findMemberships(List.of(10, 11), 1)).thenReturn(List.of(membership10, membership11));
-		when(messages.countUnreadAfter(eq(10), eq(1), any(), eq(5L))).thenReturn(2L);
-		when(messages.countUnread(11, 1)).thenReturn(4L);
+		when(conversations.existsById(10)).thenReturn(true);
+		when(members.findMembership(10, 1)).thenReturn(Optional.of(membership));
+		when(messages.findById(5L)).thenReturn(Optional.of(readThrough));
+		when(messages.findTopByConversationIdOrderByCreatedAtDescIdDesc(10)).thenReturn(Optional.of(latest));
 
-		Map<Integer, Long> counts = progress.unreadCounts(1, List.of(10, 11));
+		ProgressResponse response = progress.acceptRead(1, 10, new ProgressRequest(5L));
 
-		assertEquals(Map.of(10, 2L, 11, 4L), counts);
-		verify(members).findMemberships(List.of(10, 11), 1);
+		assertTrue(response.hasUnread());
 	}
 
 	@Test
-	void unreadCountsReturnsZerosForEmptyInput() {
-		assertEquals(Map.of(), progress.unreadCounts(1, List.of()));
+	void acceptReadClearsHasUnreadWhenLatestMatchesReadCursor() throws Exception {
+		Conversation conversation = Conversation.direct("1:2");
+		setConversationId(conversation, 10);
+		User alice = user(1, "alice");
+		User bob = user(2, "bob");
+		ConversationMember membership = new ConversationMember(conversation, alice);
+		Message latest = new Message(conversation, bob, "latest", UUID.randomUUID(), List.of());
+		setMessageId(latest, 9L);
+		setMessageCreatedAt(latest, membership.getJoinedAt().plusSeconds(30));
+
+		when(conversations.existsById(10)).thenReturn(true);
+		when(members.findMembership(10, 1)).thenReturn(Optional.of(membership));
+		when(messages.findById(9L)).thenReturn(Optional.of(latest));
+		when(messages.findTopByConversationIdOrderByCreatedAtDescIdDesc(10)).thenReturn(Optional.of(latest));
+		when(messages.findSenderIdsThrough(10, 9L)).thenReturn(List.of(2));
+
+		ProgressResponse response = progress.acceptRead(1, 10, new ProgressRequest(9L));
+
+		assertFalse(response.hasUnread());
 	}
 
 	private static User user(int id, String username) throws Exception {
@@ -74,6 +99,18 @@ class MessageProgressServiceTest {
 		Field field = Conversation.class.getDeclaredField("id");
 		field.setAccessible(true);
 		field.set(conversation, id);
+	}
+
+	private static void setMessageId(Message message, long id) throws Exception {
+		Field field = Message.class.getDeclaredField("id");
+		field.setAccessible(true);
+		field.set(message, id);
+	}
+
+	private static void setMessageCreatedAt(Message message, Instant createdAt) throws Exception {
+		Field field = Message.class.getDeclaredField("createdAt");
+		field.setAccessible(true);
+		field.set(message, createdAt);
 	}
 
 	private static void setReadCursor(ConversationMember member, Long messageId, Instant at) throws Exception {

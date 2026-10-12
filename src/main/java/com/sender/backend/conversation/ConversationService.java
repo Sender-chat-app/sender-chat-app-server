@@ -8,7 +8,6 @@ import com.sender.backend.conversation.ConversationDtos.*;
 import com.sender.backend.message.Message;
 import com.sender.backend.message.MessageAttachment;
 import com.sender.backend.message.MessageRepository;
-import com.sender.backend.message.MessageProgressService;
 import com.sender.backend.presence.PresenceService;
 import com.sender.backend.realtime.RealtimePublisher;
 import com.sender.backend.storage.ObjectPublicUrl;
@@ -48,7 +47,6 @@ public class ConversationService {
     private final MessageRepository messages;
     private final FriendshipRepository friendships;
     private final UserRepository users;
-    private final MessageProgressService progress;
     private final PresenceService presence;
     private final RealtimePublisher realtime;
     private final ObjectStorage storage;
@@ -59,7 +57,7 @@ public class ConversationService {
 
     public ConversationService(ConversationRepository conversations, ConversationMemberRepository members,
                                MessageRepository messages, FriendshipRepository friendships, UserRepository users,
-                               MessageProgressService progress, PresenceService presence, RealtimePublisher realtime,
+                               PresenceService presence, RealtimePublisher realtime,
                                ObjectStorage storage, ObjectPublicUrl publicUrls,
                                PlatformTransactionManager transactionManager,
                                @Value("${app.s3.presign-seconds:300}") long presignSeconds,
@@ -69,7 +67,6 @@ public class ConversationService {
         this.messages = messages;
         this.friendships = friendships;
         this.users = users;
-        this.progress = progress;
         this.presence = presence;
         this.realtime = realtime;
         this.storage = storage;
@@ -278,16 +275,17 @@ public class ConversationService {
                 .stream()
                 .collect(Collectors.groupingBy(member -> member.getId().getConversationId()));
         Map<Integer, Message> latestByConversation = latestMessagesByConversation(conversationIds);
-        Map<Integer, Long> unreadByConversation = progress.unreadCounts(userId, conversationIds);
         Set<Integer> friendIds = new HashSet<>(friendships.findFriendIds(userId, Friendship.Status.ACCEPTED));
 
         Set<Integer> peerIds = new HashSet<>();
         List<PendingSummary> pending = new ArrayList<>(values.size());
         for (Conversation conversation : values) {
+            List<ConversationMember> conversationMembers =
+                    membersByConversation.getOrDefault(conversation.getId(), List.of());
             PublicUser other = null;
             Integer friendPeerId = null;
             if (conversation.getType() == Conversation.Type.DIRECT) {
-                other = membersByConversation.getOrDefault(conversation.getId(), List.of()).stream()
+                other = conversationMembers.stream()
                         .map(ConversationMember::getUser)
                         .filter(user -> !user.getId().equals(userId))
                         .findFirst()
@@ -300,7 +298,10 @@ public class ConversationService {
             }
             String avatarUrl = conversation.getType() == Conversation.Type.GROUP ? conversation.getAvatarUrl() : null;
             Message latest = latestByConversation.get(conversation.getId());
-            int unread = Math.toIntExact(unreadByConversation.getOrDefault(conversation.getId(), 0L));
+            ConversationMember viewer = conversationMembers.stream()
+                    .filter(member -> member.getUser().getId().equals(userId))
+                    .findFirst()
+                    .orElse(null);
             pending.add(new PendingSummary(
                     conversation.getId(),
                     conversation.getType(),
@@ -308,7 +309,7 @@ public class ConversationService {
                     avatarUrl,
                     other,
                     latest == null ? null : LatestMessage.from(latest),
-                    unread,
+                    hasUnread(latest, viewer),
                     conversation.getUpdatedAt(),
                     friendPeerId));
         }
@@ -323,6 +324,26 @@ public class ConversationService {
         }
         return messages.findAllWithSenderByIdIn(latestIds).stream()
                 .collect(Collectors.toMap(message -> message.getConversation().getId(), Function.identity()));
+    }
+
+    /**
+     * True when the latest message is strictly after the viewer's last-read cursor.
+     * Own latest messages do not count as unread.
+     */
+    private static boolean hasUnread(Message latest, ConversationMember viewer) {
+        if (latest == null || viewer == null) {
+            return false;
+        }
+        if (latest.getSender().getId().equals(viewer.getUser().getId())) {
+            return false;
+        }
+        Long lastReadId = viewer.getLastReadMessageId();
+        Instant lastReadAt = viewer.getLastReadAt();
+        if (lastReadId == null || lastReadAt == null) {
+            return true;
+        }
+        return latest.getCreatedAt().isAfter(lastReadAt)
+                || (latest.getCreatedAt().equals(lastReadAt) && latest.getId() > lastReadId);
     }
 
     private ConversationResponse response(Conversation conversation) {
@@ -434,7 +455,7 @@ public class ConversationService {
             String avatarUrl,
             PublicUser otherUser,
             LatestMessage latestMessage,
-            int unreadCount,
+            boolean hasUnread,
             Instant updatedAt,
             Integer friendPeerId) {}
 
@@ -452,7 +473,7 @@ public class ConversationService {
                             item.avatarUrl(),
                             item.otherUser(),
                             item.latestMessage(),
-                            item.unreadCount(),
+                            item.hasUnread(),
                             item.updatedAt(),
                             item.friendPeerId() != null && onlinePeers.contains(item.friendPeerId())))
                     .toList();

@@ -5,7 +5,6 @@ import com.sender.backend.conversation.ConversationDtos.*;
 import com.sender.backend.friendship.Friendship;
 import com.sender.backend.friendship.FriendshipRepository;
 import com.sender.backend.message.Message;
-import com.sender.backend.message.MessageProgressService;
 import com.sender.backend.message.MessageRepository;
 import com.sender.backend.presence.PresenceService;
 import com.sender.backend.realtime.RealtimePublisher;
@@ -29,7 +28,6 @@ import java.lang.reflect.Field;
 import java.net.URI;
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -45,7 +43,6 @@ class ConversationServiceTest {
 	@Mock MessageRepository messages;
 	@Mock FriendshipRepository friendships;
 	@Mock UserRepository users;
-	@Mock MessageProgressService progress;
 	@Mock PresenceService presence;
 	@Mock RealtimePublisher realtime;
 	@Mock ObjectStorage storage;
@@ -57,7 +54,7 @@ class ConversationServiceTest {
 	void setUp() {
 		lenient().when(transactionManager.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
 		service = new ConversationService(
-				conversations, members, messages, friendships, users, progress, presence,
+				conversations, members, messages, friendships, users, presence,
 				realtime, storage, new ObjectPublicUrl("https://cdn.example.com"),
 				transactionManager, 300, 2 * 1024 * 1024);
 	}
@@ -76,7 +73,6 @@ class ConversationServiceTest {
 				.thenReturn(List.of(new ConversationMember(direct, alice), new ConversationMember(direct, bob)));
 		when(messages.findLatestMessageIds(List.of(10))).thenReturn(List.of(99L));
 		when(messages.findAllWithSenderByIdIn(List.of(99L))).thenReturn(List.of(latest));
-		when(progress.unreadCounts(1, List.of(10))).thenReturn(Map.of(10, 3L));
 		when(friendships.findFriendIds(1, Friendship.Status.ACCEPTED)).thenReturn(List.of(2));
 		when(presence.onlineAmong(Set.of(2))).thenReturn(Set.of(2));
 
@@ -87,7 +83,7 @@ class ConversationServiceTest {
 		assertEquals(10, summary.id());
 		assertEquals(new PublicUser(2, "bob", "bob@example.com", "bob", null), summary.otherUser());
 		assertEquals("hello", summary.latestMessage().body());
-		assertEquals(3, summary.unreadCount());
+		assertTrue(summary.hasUnread());
 		assertTrue(summary.online());
 		verify(presence).onlineAmong(Set.of(2));
 		verify(presence, never()).isOnline(any());
@@ -107,15 +103,40 @@ class ConversationServiceTest {
 		when(members.findByConversationIdIn(List.of(10)))
 				.thenReturn(List.of(new ConversationMember(direct, alice), new ConversationMember(direct, bob)));
 		when(messages.findLatestMessageIds(List.of(10))).thenReturn(List.of());
-		when(progress.unreadCounts(1, List.of(10))).thenReturn(Map.of(10, 0L));
 		when(friendships.findFriendIds(1, Friendship.Status.ACCEPTED)).thenReturn(List.of());
 		when(presence.onlineAmong(Set.of())).thenReturn(Set.of());
 
 		Page<Summary> page = service.list(1, null, 30);
 
 		assertFalse(page.items().getFirst().online());
+		assertFalse(page.items().getFirst().hasUnread());
 		assertEquals(new PublicUser(2, "bob", "bob@example.com", "bob", null), page.items().getFirst().otherUser());
 		verify(presence).onlineAmong(Set.of());
+	}
+
+	@Test
+	void listHasUnreadFalseWhenLatestMatchesLastRead() throws Exception {
+		Conversation direct = Conversation.direct("1:2");
+		setId(direct, 10);
+		User alice = user(1, "alice");
+		User bob = user(2, "bob");
+		ConversationMember aliceMembership = new ConversationMember(direct, alice);
+		setReadCursor(aliceMembership, 99L, Instant.parse("2026-10-08T00:00:00Z"));
+		Message latest = new Message(direct, bob, "hello", UUID.randomUUID(), List.of());
+		setMessageId(latest, 99L);
+		setMessageCreatedAt(latest, Instant.parse("2026-10-08T00:00:00Z"));
+
+		when(conversations.findForUser(eq(1), any(Pageable.class))).thenReturn(List.of(direct));
+		when(members.findByConversationIdIn(List.of(10)))
+				.thenReturn(List.of(aliceMembership, new ConversationMember(direct, bob)));
+		when(messages.findLatestMessageIds(List.of(10))).thenReturn(List.of(99L));
+		when(messages.findAllWithSenderByIdIn(List.of(99L))).thenReturn(List.of(latest));
+		when(friendships.findFriendIds(1, Friendship.Status.ACCEPTED)).thenReturn(List.of(2));
+		when(presence.onlineAmong(Set.of(2))).thenReturn(Set.of());
+
+		Page<Summary> page = service.list(1, null, 30);
+
+		assertFalse(page.items().getFirst().hasUnread());
 	}
 
 	@Test
@@ -242,5 +263,20 @@ class ConversationServiceTest {
 		Field field = Message.class.getDeclaredField("id");
 		field.setAccessible(true);
 		field.set(message, id);
+	}
+
+	private static void setMessageCreatedAt(Message message, Instant createdAt) throws Exception {
+		Field field = Message.class.getDeclaredField("createdAt");
+		field.setAccessible(true);
+		field.set(message, createdAt);
+	}
+
+	private static void setReadCursor(ConversationMember member, Long messageId, Instant at) throws Exception {
+		Field idField = ConversationMember.class.getDeclaredField("lastReadMessageId");
+		idField.setAccessible(true);
+		idField.set(member, messageId);
+		Field atField = ConversationMember.class.getDeclaredField("lastReadAt");
+		atField.setAccessible(true);
+		atField.set(member, at);
 	}
 }

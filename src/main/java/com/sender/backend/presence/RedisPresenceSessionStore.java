@@ -7,6 +7,8 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -25,7 +27,7 @@ public class RedisPresenceSessionStore implements PresenceSessionStore {
     @Override
     public boolean addSession(Integer userId, String sessionId) {
         try {
-            boolean wasOnline = hasLiveSession(userId);
+            boolean wasOnline = isListedOnline(userId);
             redis.opsForValue().set(sessionKey(sessionId), userId.toString(), ttl);
             redis.opsForSet().add(userSessionsKey(userId), sessionId);
             redis.expire(userSessionsKey(userId), ttl.multipliedBy(2));
@@ -82,23 +84,45 @@ public class RedisPresenceSessionStore implements PresenceSessionStore {
     @Override
     public boolean isOnline(Integer userId) {
         try {
-            pruneDeadSessions(userId);
-            return hasLiveSession(userId);
+            return isListedOnline(userId);
         } catch (RuntimeException exception) {
             log.warn("Presence registry unavailable on isOnline", exception);
             return false;
         }
     }
 
+    /**
+     * Batch membership against {@code presence:online-users} (one Redis round-trip).
+     * Stale entries are cleared by disconnect handling and the periodic sweep — not on the read path.
+     */
     @Override
     public Set<Integer> onlineAmong(Collection<Integer> userIds) {
-        Set<Integer> online = new HashSet<>();
-        for (Integer userId : userIds) {
-            if (isOnline(userId)) {
-                online.add(userId);
-            }
+        if (userIds == null || userIds.isEmpty()) {
+            return Set.of();
         }
-        return online;
+        try {
+            Set<Integer> distinct = userIds instanceof Set<Integer> set
+                    ? set
+                    : new LinkedHashSet<>(userIds);
+            if (distinct.isEmpty()) {
+                return Set.of();
+            }
+            Object[] members = distinct.stream().map(Object::toString).toArray();
+            Map<Object, Boolean> flags = redis.opsForSet().isMember(ONLINE_USERS_KEY, members);
+            if (flags == null || flags.isEmpty()) {
+                return Set.of();
+            }
+            Set<Integer> online = new HashSet<>();
+            for (Integer userId : distinct) {
+                if (Boolean.TRUE.equals(flags.get(userId.toString()))) {
+                    online.add(userId);
+                }
+            }
+            return online;
+        } catch (RuntimeException exception) {
+            log.warn("Presence registry unavailable on onlineAmong", exception);
+            return Set.of();
+        }
     }
 
     @Override
@@ -125,8 +149,11 @@ public class RedisPresenceSessionStore implements PresenceSessionStore {
         }
     }
 
+    private boolean isListedOnline(Integer userId) {
+        return Boolean.TRUE.equals(redis.opsForSet().isMember(ONLINE_USERS_KEY, userId.toString()));
+    }
+
     private boolean hasLiveSession(Integer userId) {
-        pruneDeadSessions(userId);
         Long size = redis.opsForSet().size(userSessionsKey(userId));
         return size != null && size > 0;
     }

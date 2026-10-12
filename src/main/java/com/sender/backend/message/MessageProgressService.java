@@ -9,8 +9,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 import java.time.Instant;
-import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -90,55 +88,24 @@ public class MessageProgressService {
         }
     }
 
-    @Transactional(readOnly = true)
-    public long unreadCount(Integer userId, Integer conversationId) {
-        ConversationMember member = memberForRead(userId, conversationId);
-        return unreadCount(conversationId, userId, member, pending.get(new ProgressKey(userId, conversationId)));
-    }
-
-    /**
-     * Batch unread counts for an inbox page. Skips existence checks; callers must only pass
-     * conversation IDs the viewer is already authorized to see.
-     */
-    @Transactional(readOnly = true)
-    public Map<Integer, Long> unreadCounts(Integer userId, Collection<Integer> conversationIds) {
-        if (conversationIds == null || conversationIds.isEmpty()) {
-            return Map.of();
-        }
-        Map<Integer, Long> counts = new HashMap<>();
-        for (Integer conversationId : conversationIds) {
-            counts.put(conversationId, 0L);
-        }
-        List<ConversationMember> memberships = members.findMemberships(conversationIds, userId);
-        for (ConversationMember member : memberships) {
-            Integer conversationId = member.getId().getConversationId();
-            counts.put(conversationId, unreadCount(
-                    conversationId,
-                    userId,
-                    member,
-                    pending.get(new ProgressKey(userId, conversationId))));
-        }
-        return counts;
-    }
-
     private ProgressResponse response(Integer conversationId, Integer userId,
                                       ConversationMember member, PendingProgress value) {
         Cursor delivered = max(cursor(member.getLastDeliveredMessageId(), member.getLastDeliveredAt()), value.delivered);
         Cursor read = max(cursor(member.getLastReadMessageId(), member.getLastReadAt()), value.read);
-        long unread = read == null
-                ? messages.countUnread(conversationId, userId)
-                : messages.countUnreadAfter(conversationId, userId, read.createdAt(), read.id());
+        Message latest = messages.findTopByConversationIdOrderByCreatedAtDescIdDesc(conversationId).orElse(null);
+        boolean hasUnread = hasUnread(latest, userId, read);
         return new ProgressResponse(conversationId,
                 delivered == null ? null : delivered.id(), delivered == null ? null : delivered.createdAt(),
-                read == null ? null : read.id(), read == null ? null : read.createdAt(), unread);
+                read == null ? null : read.id(), read == null ? null : read.createdAt(), hasUnread);
     }
 
-    private long unreadCount(Integer conversationId, Integer userId, ConversationMember member, PendingProgress value) {
-        Cursor read = max(cursor(member.getLastReadMessageId(), member.getLastReadAt()),
-                value == null ? null : value.read);
+    private static boolean hasUnread(Message latest, Integer userId, Cursor read) {
+        if (latest == null || latest.getSender().getId().equals(userId)) {
+            return false;
+        }
         return read == null
-                ? messages.countUnread(conversationId, userId)
-                : messages.countUnreadAfter(conversationId, userId, read.createdAt(), read.id());
+                || latest.getCreatedAt().isAfter(read.createdAt())
+                || (latest.getCreatedAt().equals(read.createdAt()) && latest.getId() > read.id());
     }
 
     private Message messageForConversation(Integer conversationId, Long messageId, ConversationMember member) {
