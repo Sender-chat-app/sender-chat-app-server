@@ -17,16 +17,20 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.Locale;
+import java.util.function.Function;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @Service
 public class ConversationService {
@@ -51,11 +55,13 @@ public class ConversationService {
     private final ObjectPublicUrl publicUrls;
     private final Duration presignTtl;
     private final long maxBytes;
+    private final TransactionTemplate readOnlyTx;
 
     public ConversationService(ConversationRepository conversations, ConversationMemberRepository members,
                                MessageRepository messages, FriendshipRepository friendships, UserRepository users,
                                MessageProgressService progress, PresenceService presence, RealtimePublisher realtime,
                                ObjectStorage storage, ObjectPublicUrl publicUrls,
+                               PlatformTransactionManager transactionManager,
                                @Value("${app.s3.presign-seconds:300}") long presignSeconds,
                                @Value("${app.avatar.max-bytes:2097152}") long maxBytes) {
         this.conversations = conversations;
@@ -70,6 +76,8 @@ public class ConversationService {
         this.publicUrls = publicUrls;
         this.presignTtl = Duration.ofSeconds(presignSeconds);
         this.maxBytes = maxBytes;
+        this.readOnlyTx = new TransactionTemplate(transactionManager);
+        this.readOnlyTx.setReadOnly(true);
     }
 
     @Transactional
@@ -110,21 +118,10 @@ public class ConversationService {
         return response(conversation);
     }
 
-    @Transactional(readOnly = true)
     public Page<Summary> list(Integer userId, String cursor, int limit) {
-        int size = Math.min(Math.max(limit, 1), 50);
-        List<Conversation> values;
-        if (cursor == null || cursor.isBlank()) {
-            values = conversations.findForUser(userId, PageRequest.of(0, size + 1));
-        } else {
-            Cursor decoded = decode(cursor);
-            values = conversations.findForUserBefore(userId, decoded.updatedAt(), decoded.id(), PageRequest.of(0, size + 1));
-        }
-        boolean more = values.size() > size;
-        if (more) values = values.subList(0, size);
-        List<Summary> result = values.stream().map(c -> summary(c, userId)).toList();
-        String next = more ? encode(values.getLast()) : null;
-        return new Page<>(result, next, more);
+        ListAssembly assembly = Objects.requireNonNull(readOnlyTx.execute(status -> assembleList(userId, cursor, limit)));
+        Set<Integer> onlinePeers = presence.onlineAmong(assembly.peerIds());
+        return assembly.toPage(onlinePeers);
     }
 
     @Transactional(readOnly = true)
@@ -181,6 +178,7 @@ public class ConversationService {
         if (length < 1) {
             throw error(HttpStatus.BAD_REQUEST, "Avatar file size is required");
         }
+        length = Math.clamp(length, 1, maxBytes);
         if (length > maxBytes) {
             throw error(HttpStatus.PAYLOAD_TOO_LARGE, "Avatar must be 2MB or smaller");
         }
@@ -258,23 +256,73 @@ public class ConversationService {
                 new ConversationUpdatedPayload(conversationId, ConversationUpdatedPayload.Membership.REMOVED, null));
     }
 
-    private Summary summary(Conversation conversation, Integer userId) {
-        PublicUser other = null;
-        boolean online = false;
-        if (conversation.getType() == Conversation.Type.DIRECT) {
-            other = members.findByConversationId(conversation.getId()).stream()
-                    .map(ConversationMember::getUser)
-                    .filter(user -> !user.getId().equals(userId))
-                    .findFirst().map(PublicUser::from).orElse(null);
-            if (other != null && areFriends(userId, other.id())) {
-                online = presence.isOnline(other.id());
-            }
+    private ListAssembly assembleList(Integer userId, String cursor, int limit) {
+        int size = Math.clamp(limit, 1, 50);
+        List<Conversation> values;
+        if (cursor == null || cursor.isBlank()) {
+            values = conversations.findForUser(userId, PageRequest.of(0, size + 1));
+        } else {
+            Cursor decoded = decode(cursor);
+            values = conversations.findForUserBefore(userId, decoded.updatedAt(), decoded.id(), PageRequest.of(0, size + 1));
         }
-        String avatarUrl = conversation.getType() == Conversation.Type.GROUP ? conversation.getAvatarUrl() : null;
-        return new Summary(conversation.getId(), conversation.getType(), conversation.getName(), avatarUrl, other,
-                messages.findTopByConversationIdOrderByCreatedAtDescIdDesc(conversation.getId()).map(LatestMessage::from).orElse(null),
-                Math.toIntExact(progress.unreadCount(userId, conversation.getId())), conversation.getUpdatedAt(),
-                online);
+        boolean more = values.size() > size;
+        if (more) {
+            values = List.copyOf(values.subList(0, size));
+        }
+        if (values.isEmpty()) {
+            return new ListAssembly(List.of(), null, false, Set.of());
+        }
+
+        List<Integer> conversationIds = values.stream().map(Conversation::getId).toList();
+        Map<Integer, List<ConversationMember>> membersByConversation = members.findByConversationIdIn(conversationIds)
+                .stream()
+                .collect(Collectors.groupingBy(member -> member.getId().getConversationId()));
+        Map<Integer, Message> latestByConversation = latestMessagesByConversation(conversationIds);
+        Map<Integer, Long> unreadByConversation = progress.unreadCounts(userId, conversationIds);
+        Set<Integer> friendIds = new HashSet<>(friendships.findFriendIds(userId, Friendship.Status.ACCEPTED));
+
+        Set<Integer> peerIds = new HashSet<>();
+        List<PendingSummary> pending = new ArrayList<>(values.size());
+        for (Conversation conversation : values) {
+            PublicUser other = null;
+            Integer friendPeerId = null;
+            if (conversation.getType() == Conversation.Type.DIRECT) {
+                other = membersByConversation.getOrDefault(conversation.getId(), List.of()).stream()
+                        .map(ConversationMember::getUser)
+                        .filter(user -> !user.getId().equals(userId))
+                        .findFirst()
+                        .map(PublicUser::from)
+                        .orElse(null);
+                if (other != null && friendIds.contains(other.id())) {
+                    friendPeerId = other.id();
+                    peerIds.add(other.id());
+                }
+            }
+            String avatarUrl = conversation.getType() == Conversation.Type.GROUP ? conversation.getAvatarUrl() : null;
+            Message latest = latestByConversation.get(conversation.getId());
+            int unread = Math.toIntExact(unreadByConversation.getOrDefault(conversation.getId(), 0L));
+            pending.add(new PendingSummary(
+                    conversation.getId(),
+                    conversation.getType(),
+                    conversation.getName(),
+                    avatarUrl,
+                    other,
+                    latest == null ? null : LatestMessage.from(latest),
+                    unread,
+                    conversation.getUpdatedAt(),
+                    friendPeerId));
+        }
+        String next = more ? encode(values.getLast()) : null;
+        return new ListAssembly(pending, next, more, peerIds);
+    }
+
+    private Map<Integer, Message> latestMessagesByConversation(Collection<Integer> conversationIds) {
+        List<Long> latestIds = messages.findLatestMessageIds(conversationIds);
+        if (latestIds.isEmpty()) {
+            return Map.of();
+        }
+        return messages.findAllWithSenderByIdIn(latestIds).stream()
+                .collect(Collectors.toMap(message -> message.getConversation().getId(), Function.identity()));
     }
 
     private ConversationResponse response(Conversation conversation) {
@@ -378,4 +426,37 @@ public class ConversationService {
     }
 
     private record Cursor(Instant updatedAt, Integer id) {}
+
+    private record PendingSummary(
+            Integer id,
+            Conversation.Type type,
+            String name,
+            String avatarUrl,
+            PublicUser otherUser,
+            LatestMessage latestMessage,
+            int unreadCount,
+            Instant updatedAt,
+            Integer friendPeerId) {}
+
+    private record ListAssembly(
+            List<PendingSummary> items,
+            String nextCursor,
+            boolean hasMore,
+            Set<Integer> peerIds) {
+        Page<Summary> toPage(Set<Integer> onlinePeers) {
+            List<Summary> summaries = items.stream()
+                    .map(item -> new Summary(
+                            item.id(),
+                            item.type(),
+                            item.name(),
+                            item.avatarUrl(),
+                            item.otherUser(),
+                            item.latestMessage(),
+                            item.unreadCount(),
+                            item.updatedAt(),
+                            item.friendPeerId() != null && onlinePeers.contains(item.friendPeerId())))
+                    .toList();
+            return new Page<>(summaries, nextCursor, hasMore);
+        }
+    }
 }

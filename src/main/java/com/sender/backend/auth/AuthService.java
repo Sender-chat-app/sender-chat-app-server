@@ -12,13 +12,16 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.authentication.*;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
+import java.util.Objects;
 
 @Service
 public class AuthService {
@@ -29,39 +32,54 @@ public class AuthService {
 	private final JwtService jwtService;
 	private final long refreshTokenDays;
 	private final SecureRandom secureRandom = new SecureRandom();
+	private final TransactionTemplate tx;
 
 	public AuthService(UserRepository users, AuthSessionRepository sessions, PasswordEncoder passwordEncoder,
-			JwtService jwtService, @Value("${app.auth.refresh-token-days}") long refreshTokenDays) {
+			JwtService jwtService, PlatformTransactionManager transactionManager,
+			@Value("${app.auth.refresh-token-days}") long refreshTokenDays) {
 		this.users = users;
 		this.sessions = sessions;
 		this.passwordEncoder = passwordEncoder;
 		this.jwtService = jwtService;
 		this.refreshTokenDays = refreshTokenDays;
+		this.tx = new TransactionTemplate(transactionManager);
 	}
 
-	@Transactional
 	public SessionResult register(RegisterRequest request) {
 		String email = normalizeEmail(request.email());
 		String username = request.username().toLowerCase();
 		if (users.existsByEmail(email) || users.existsByUsername(username)) {
 			throw new BadCredentialsException(INVALID_CREDENTIALS);
 		}
+		// Encode before opening a transaction so the pool is not held during BCrypt.
+		String passwordHash = passwordEncoder.encode(request.password());
 		try {
-			User user = users.save(new User(username, email, passwordEncoder.encode(request.password())));
-			return createSession(user);
+			return Objects.requireNonNull(tx.execute(status -> {
+				if (users.existsByEmail(email) || users.existsByUsername(username)) {
+					throw new BadCredentialsException(INVALID_CREDENTIALS);
+				}
+				User user = users.save(new User(username, email, passwordHash));
+				return createSession(user);
+			}));
 		} catch (DataIntegrityViolationException exception) {
 			throw new BadCredentialsException(INVALID_CREDENTIALS);
 		}
 	}
 
-	@Transactional
 	public SessionResult login(LoginRequest request) {
 		User user = users.findByEmail(normalizeEmail(request.email()))
 				.orElseThrow(() -> new BadCredentialsException(INVALID_CREDENTIALS));
-		if (!passwordEncoder.matches(request.password(), user.getPasswordHash())) {
+		Integer userId = user.getId();
+		String passwordHash = user.getPasswordHash();
+		// BCrypt outside a DB transaction so Hikari connections are not held during hashing.
+		if (!passwordEncoder.matches(request.password(), passwordHash)) {
 			throw new BadCredentialsException(INVALID_CREDENTIALS);
 		}
-		return createSession(user);
+		return Objects.requireNonNull(tx.execute(status -> {
+			User managed = users.findById(userId)
+					.orElseThrow(() -> new BadCredentialsException(INVALID_CREDENTIALS));
+			return createSession(managed);
+		}));
 	}
 
 	@Transactional
@@ -88,15 +106,19 @@ public class AuthService {
 		}
 	}
 
-	@Transactional
 	public void changePassword(Integer userId, ChangePasswordRequest request) {
 		User user = users.findById(userId)
 				.orElseThrow(() -> new BadCredentialsException(INVALID_CREDENTIALS));
 		if (!passwordEncoder.matches(request.currentPassword(), user.getPasswordHash())) {
 			throw new BadCredentialsException(INVALID_CREDENTIALS);
 		}
-		user.setPasswordHash(passwordEncoder.encode(request.newPassword()));
-		sessions.findAllByUserId(userId).forEach(AuthSession::revoke);
+		String passwordHash = passwordEncoder.encode(request.newPassword());
+		tx.executeWithoutResult(status -> {
+			User managed = users.findById(userId)
+					.orElseThrow(() -> new BadCredentialsException(INVALID_CREDENTIALS));
+			managed.setPasswordHash(passwordHash);
+			sessions.findAllByUserId(userId).forEach(AuthSession::revoke);
+		});
 	}
 
 	private SessionResult createSession(User user) {

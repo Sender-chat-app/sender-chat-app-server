@@ -1,7 +1,10 @@
 package com.sender.backend.conversation;
 
+import com.sender.backend.auth.AuthDtos.PublicUser;
 import com.sender.backend.conversation.ConversationDtos.*;
+import com.sender.backend.friendship.Friendship;
 import com.sender.backend.friendship.FriendshipRepository;
+import com.sender.backend.message.Message;
 import com.sender.backend.message.MessageProgressService;
 import com.sender.backend.message.MessageRepository;
 import com.sender.backend.presence.PresenceService;
@@ -16,14 +19,20 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.SimpleTransactionStatus;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.lang.reflect.Field;
 import java.net.URI;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -40,15 +49,73 @@ class ConversationServiceTest {
 	@Mock PresenceService presence;
 	@Mock RealtimePublisher realtime;
 	@Mock ObjectStorage storage;
+	@Mock PlatformTransactionManager transactionManager;
 
 	private ConversationService service;
 
 	@BeforeEach
 	void setUp() {
+		lenient().when(transactionManager.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
 		service = new ConversationService(
 				conversations, members, messages, friendships, users, progress, presence,
 				realtime, storage, new ObjectPublicUrl("https://cdn.example.com"),
-				300, 2 * 1024 * 1024);
+				transactionManager, 300, 2 * 1024 * 1024);
+	}
+
+	@Test
+	void listHydratesInboxOnceAndReadsPresenceOutsideDbWork() throws Exception {
+		Conversation direct = Conversation.direct("1:2");
+		setId(direct, 10);
+		User alice = user(1, "alice");
+		User bob = user(2, "bob");
+		Message latest = new Message(direct, bob, "hello", UUID.randomUUID(), List.of());
+		setMessageId(latest, 99L);
+
+		when(conversations.findForUser(eq(1), any(Pageable.class))).thenReturn(List.of(direct));
+		when(members.findByConversationIdIn(List.of(10)))
+				.thenReturn(List.of(new ConversationMember(direct, alice), new ConversationMember(direct, bob)));
+		when(messages.findLatestMessageIds(List.of(10))).thenReturn(List.of(99L));
+		when(messages.findAllWithSenderByIdIn(List.of(99L))).thenReturn(List.of(latest));
+		when(progress.unreadCounts(1, List.of(10))).thenReturn(Map.of(10, 3L));
+		when(friendships.findFriendIds(1, Friendship.Status.ACCEPTED)).thenReturn(List.of(2));
+		when(presence.onlineAmong(Set.of(2))).thenReturn(Set.of(2));
+
+		Page<Summary> page = service.list(1, null, 30);
+
+		assertEquals(1, page.items().size());
+		Summary summary = page.items().getFirst();
+		assertEquals(10, summary.id());
+		assertEquals(new PublicUser(2, "bob", "bob@example.com", "bob", null), summary.otherUser());
+		assertEquals("hello", summary.latestMessage().body());
+		assertEquals(3, summary.unreadCount());
+		assertTrue(summary.online());
+		verify(presence).onlineAmong(Set.of(2));
+		verify(presence, never()).isOnline(any());
+		verify(friendships).findFriendIds(1, Friendship.Status.ACCEPTED);
+		verify(friendships, never()).findBetween(any(), any());
+		verify(transactionManager).commit(any());
+	}
+
+	@Test
+	void listMarksDirectPeerOfflineWhenNotAcceptedFriend() throws Exception {
+		Conversation direct = Conversation.direct("1:2");
+		setId(direct, 10);
+		User alice = user(1, "alice");
+		User bob = user(2, "bob");
+
+		when(conversations.findForUser(eq(1), any(Pageable.class))).thenReturn(List.of(direct));
+		when(members.findByConversationIdIn(List.of(10)))
+				.thenReturn(List.of(new ConversationMember(direct, alice), new ConversationMember(direct, bob)));
+		when(messages.findLatestMessageIds(List.of(10))).thenReturn(List.of());
+		when(progress.unreadCounts(1, List.of(10))).thenReturn(Map.of(10, 0L));
+		when(friendships.findFriendIds(1, Friendship.Status.ACCEPTED)).thenReturn(List.of());
+		when(presence.onlineAmong(Set.of())).thenReturn(Set.of());
+
+		Page<Summary> page = service.list(1, null, 30);
+
+		assertFalse(page.items().getFirst().online());
+		assertEquals(new PublicUser(2, "bob", "bob@example.com", "bob", null), page.items().getFirst().otherUser());
+		verify(presence).onlineAmong(Set.of());
 	}
 
 	@Test
@@ -169,5 +236,11 @@ class ConversationServiceTest {
 		Field field = Conversation.class.getDeclaredField("id");
 		field.setAccessible(true);
 		field.set(conversation, id);
+	}
+
+	private static void setMessageId(Message message, long id) throws Exception {
+		Field field = Message.class.getDeclaredField("id");
+		field.setAccessible(true);
+		field.set(message, id);
 	}
 }

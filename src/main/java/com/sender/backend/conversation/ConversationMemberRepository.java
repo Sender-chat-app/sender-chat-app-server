@@ -9,6 +9,21 @@ public interface ConversationMemberRepository extends JpaRepository<Conversation
     boolean existsByConversationIdAndUserId(Integer conversationId, Integer userId);
     long countByConversationId(Integer conversationId);
     List<ConversationMember> findByConversationId(Integer conversationId);
+
+    @Query("""
+        select m from ConversationMember m
+        join fetch m.user
+        where m.conversation.id in :conversationIds
+        """)
+    List<ConversationMember> findByConversationIdIn(@Param("conversationIds") Collection<Integer> conversationIds);
+
+    @Query("""
+        select m from ConversationMember m
+        where m.conversation.id in :conversationIds and m.user.id = :userId
+        """)
+    List<ConversationMember> findMemberships(@Param("conversationIds") Collection<Integer> conversationIds,
+                                              @Param("userId") Integer userId);
+
     @Query("""
         select m from ConversationMember m
         where m.conversation.id = :conversationId and m.user.id = :userId

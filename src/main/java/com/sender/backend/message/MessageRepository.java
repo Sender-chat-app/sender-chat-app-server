@@ -28,6 +28,22 @@ public interface MessageRepository extends JpaRepository<Message, Long> {
     Optional<Message> findByConversationIdAndSenderIdAndClientMessageId(Integer conversationId, Integer senderId, UUID clientMessageId);
     Optional<Message> findTopByConversationIdOrderByCreatedAtDescIdDesc(Integer conversationId);
 
+    @Query(value = """
+        select distinct on (conversation_id) id
+        from messages
+        where conversation_id in (:conversationIds)
+        order by conversation_id, created_at desc, id desc
+        """, nativeQuery = true)
+    List<Long> findLatestMessageIds(@Param("conversationIds") Collection<Integer> conversationIds);
+
+    @Query("""
+        select m from Message m
+        join fetch m.sender
+        join fetch m.conversation
+        where m.id in :ids
+        """)
+    List<Message> findAllWithSenderByIdIn(@Param("ids") Collection<Long> ids);
+
     @Query("""
         select m from Message m
         where m.conversation.id = :conversationId
